@@ -1,0 +1,69 @@
+{
+  "entities": {
+    "Exam": {
+      "title": "Exam",
+      "description": "Exam template created by a teacher",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "title": { "type": "string" },
+        "type": { "type": "string", "enum": ["mcq", "essay"] },
+        "durationMinutes": { "type": "number" },
+        "questions": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "id": { "type": "string" },
+              "text": { "type": "string" },
+              "type": { "type": "string", "enum": ["mcq", "essay"] },
+              "options": { "type": "array", "items": { "type": "string" } },
+              "correctOptionIndex": { "type": "number" },
+              "idealAnswer": { "type": "string" }
+            }
+          }
+        },
+        "sessionCode": { "type": "string" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["title", "type", "durationMinutes", "questions", "sessionCode"]
+    },
+    "Submission": {
+      "title": "Submission",
+      "description": "Student exam submission",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "examId": { "type": "string" },
+        "studentName": { "type": "string" },
+        "answers": { "type": "object" },
+        "violations": { "type": "number" },
+        "status": { "type": "string", "enum": ["in-progress", "submitted"] },
+        "score": { "type": "number" },
+        "essayEvaluations": { "type": "object" },
+        "submittedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["examId", "studentName", "status"]
+    },
+    "Violation": {
+      "title": "Violation",
+      "description": "Proctoring violation alert",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "examId": { "type": "string" },
+        "submissionId": { "type": "string" },
+        "studentName": { "type": "string" },
+        "reason": { "type": "string" },
+        "screenshot": { "type": "string", "description": "Base64 image data" },
+        "timestamp": { "type": "string", "format": "date-time" }
+      },
+      "required": ["examId", "submissionId", "studentName", "reason", "timestamp"]
+    }
+  },
+  "firestore": {
+    "/exams/{examId}": { "schema": "Exam", "description": "Exam templates" },
+    "/submissions/{submissionId}": { "schema": "Submission", "description": "Student submissions" },
+    "/violations/{violationId}": { "schema": "Violation", "description": "Real-time proctoring violations" }
+  }
+}

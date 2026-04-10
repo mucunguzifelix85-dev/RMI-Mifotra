@@ -1,0 +1,5 @@
+{
+  "name": "RMI & Mifotra digital exam",
+  "description": "A secure digital exam platform with real-time proctoring, automated evaluation, and strict time management.",
+  "requestFramePermissions": ["camera", "microphone"]
+}
