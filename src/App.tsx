@@ -2,15 +2,17 @@
  * @license
  * SPDX-License-Identifier: Apache-2.0
  *
- * UPDATED: 
- * 1. AI gaze detection — 3 look-aways = auto-submit
- * 2. Camera always required & enforced
- * 3. Teacher accounts (register/login) stored in Firestore
- * 4. Student sees teacher name + exam title before exam
- * 5. AI answer hints for essay questions
+ * FIXES APPLIED:
+ * 1. Removed orderBy('createdAt') from submissions query → fixes Firestore composite index error
+ * 2. AI hint now routed through Gemini (GeminiService) instead of direct Anthropic API call → fixes CORS/401 error
+ * 3. proctoringIntervalRef closure fixed → captures view via ref, not stale closure
+ * 4. stopProctoring called on submitExam always, not just sometimes
+ * 5. Added null-checks before Firestore writes to prevent crashes
+ * 6. handleViolation made safe with useCallback-style ref pattern
+ * 7. createdAt added to submission docs properly
  */
 
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { db, auth } from './firebase';
 import {
   collection, addDoc, getDocs, query, where, doc, getDoc,
@@ -76,7 +78,7 @@ interface Violation {
 }
 
 // ─────────────────────────────────────────────
-// CreateExamView (unchanged except teacherId/Name injection)
+// CreateExamView
 // ─────────────────────────────────────────────
 
 interface CreateExamViewProps {
@@ -152,7 +154,6 @@ const CreateExamView: React.FC<CreateExamViewProps> = ({ onBack, onCreate, isLoa
 
       <div className="bg-white p-8 rounded-3xl shadow-sm border border-gray-100 space-y-6">
         <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
-          {/* Exam Type */}
           <div>
             <label className="block text-sm font-medium text-gray-700 mb-1">Exam Type</label>
             <div className="flex gap-2 p-1 bg-gray-50 rounded-xl border border-gray-100">
@@ -164,14 +165,12 @@ const CreateExamView: React.FC<CreateExamViewProps> = ({ onBack, onCreate, isLoa
               ))}
             </div>
           </div>
-          {/* Title */}
           <div>
             <label className="block text-sm font-medium text-gray-700 mb-1">Exam Title</label>
             <input type="text" value={title} onChange={e => setTitle(e.target.value)}
               placeholder="e.g. Final Mathematics 101"
               className="w-full px-4 py-3 rounded-xl border border-gray-200 focus:ring-2 focus:ring-brand-blue outline-none" />
           </div>
-          {/* Duration */}
           <div>
             <label className="block text-sm font-medium text-gray-700 mb-1">Duration (Minutes)</label>
             <input type="number" value={duration} onChange={e => setDuration(parseInt(e.target.value) || 0)}
@@ -179,7 +178,6 @@ const CreateExamView: React.FC<CreateExamViewProps> = ({ onBack, onCreate, isLoa
           </div>
         </div>
 
-        {/* Camera note — always required now */}
         <div className="flex items-center gap-3 bg-blue-50 p-4 rounded-xl border border-blue-100">
           <Camera className="w-5 h-5 text-brand-blue shrink-0" />
           <p className="text-sm text-blue-700 font-medium">
@@ -188,7 +186,6 @@ const CreateExamView: React.FC<CreateExamViewProps> = ({ onBack, onCreate, isLoa
           </p>
         </div>
 
-        {/* Questions */}
         <div className="space-y-4">
           <div className="flex flex-wrap justify-between items-center gap-4">
             <h3 className="font-bold text-gray-900">Questions ({questions.length})</h3>
@@ -293,7 +290,6 @@ export default function App() {
   const [teacherProfile, setTeacherProfile] = useState<TeacherProfile | null>(null);
   const [authLoading, setAuthLoading] = useState(true);
 
-  // Teacher register/login form state
   const [regName, setRegName] = useState('');
   const [regEmail, setRegEmail] = useState('');
   const [regPassword, setRegPassword] = useState('');
@@ -301,7 +297,6 @@ export default function App() {
   const [loginPassword, setLoginPassword] = useState('');
   const [authError, setAuthError] = useState('');
 
-  // Exam/session state
   const [currentExam, setCurrentExam] = useState<Exam | null>(null);
   const [currentSubmission, setCurrentSubmission] = useState<Submission | null>(null);
   const [studentName, setStudentName] = useState('');
@@ -309,29 +304,38 @@ export default function App() {
   const [newExamCode, setNewExamCode] = useState<string | null>(null);
   const [isGenerating, setIsGenerating] = useState(false);
 
-  // Teacher dashboard state
   const [exams, setExams] = useState<Exam[]>([]);
   const [allSubmissions, setAllSubmissions] = useState<Submission[]>([]);
   const [allViolations, setAllViolations] = useState<Violation[]>([]);
   const [selectedSubmission, setSelectedSubmission] = useState<Submission | null>(null);
   const [isClearingDb, setIsClearingDb] = useState(false);
 
-  // Student exam state
   const [currentQuestionIndex, setCurrentQuestionIndex] = useState(0);
   const [answers, setAnswers] = useState<Record<string, any>>({});
   const [timeLeft, setTimeLeft] = useState(0);
   const [violations, setViolations] = useState(0);
-  const [gazeViolations, setGazeViolations] = useState(0); // NEW: track gaze-away count
-  const [cameraBlocked, setCameraBlocked] = useState(false); // NEW: camera required gate
-  const [aiHint, setAiHint] = useState<string | null>(null); // NEW: AI hint for essay
+  const [gazeViolations, setGazeViolations] = useState(0);
+  const [cameraBlocked, setCameraBlocked] = useState(false);
+  const [aiHint, setAiHint] = useState<string | null>(null);
   const [isLoadingHint, setIsLoadingHint] = useState(false);
 
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const timerRef = useRef<NodeJS.Timeout | null>(null);
-  const gazeViolationsRef = useRef(0); // ref for up-to-date count inside async callbacks
+  const gazeViolationsRef = useRef(0);
+  const violationsRef = useRef(0);           // FIX: ref so async callbacks always have latest count
   const streamRef = useRef<MediaStream | null>(null);
   const proctoringIntervalRef = useRef<NodeJS.Timeout | null>(null);
+  const viewRef = useRef<View>('landing');   // FIX: ref so interval closure always has latest view
+  const currentSubmissionRef = useRef<Submission | null>(null);
+  const currentExamRef = useRef<Exam | null>(null);
+  const isSubmittingRef = useRef(false);     // FIX: prevent double submit
+
+  // Keep refs in sync with state
+  useEffect(() => { viewRef.current = view; }, [view]);
+  useEffect(() => { currentSubmissionRef.current = currentSubmission; }, [currentSubmission]);
+  useEffect(() => { currentExamRef.current = currentExam; }, [currentExam]);
+  useEffect(() => { violationsRef.current = violations; }, [violations]);
 
   // ── Auth listener
   useEffect(() => {
@@ -356,9 +360,18 @@ export default function App() {
     if (!teacherProfile) return;
     fetchExams();
 
-    const subQ = query(collection(db, 'submissions'), where('examTeacherId', '==', teacherProfile.id), orderBy('createdAt', 'desc'));
+    // FIX: Removed orderBy('createdAt','desc') from submissions query.
+    // That query requires a Firestore composite index which you may not have created.
+    // We sort client-side instead.
+    const subQ = query(
+      collection(db, 'submissions'),
+      where('examTeacherId', '==', teacherProfile.id)
+    );
     const unsubSubs = onSnapshot(subQ, snap => {
-      setAllSubmissions(snap.docs.map(d => ({ id: d.id, ...d.data() } as Submission)));
+      const subs = snap.docs.map(d => ({ id: d.id, ...d.data() } as Submission));
+      // Sort client-side: newest first
+      subs.sort((a: any, b: any) => (b.createdAt?.seconds || 0) - (a.createdAt?.seconds || 0));
+      setAllSubmissions(subs);
     }, e => handleFirestoreError(e, OperationType.LIST, 'submissions'));
 
     const violQ = query(collection(db, 'violations'), where('teacherId', '==', teacherProfile.id));
@@ -371,36 +384,47 @@ export default function App() {
     return () => { unsubSubs(); unsubViols(); };
   }, [teacherProfile]);
 
-  // ── Exam timer & proctoring
+  // ── Exam timer (per question)
   useEffect(() => {
-    if (view === 'student-exam' && currentExam) {
-      const totalSec = (currentExam.durationMinutes * 60) / currentExam.questions.length;
-      setTimeLeft(Math.floor(totalSec));
+    if (view !== 'student-exam' || !currentExam) return;
 
-      timerRef.current = setInterval(() => {
-        setTimeLeft(prev => {
-          if (prev <= 1) { handleNextQuestion(); return Math.floor(totalSec); }
-          return prev - 1;
-        });
-      }, 1000);
+    const totalSec = Math.floor((currentExam.durationMinutes * 60) / currentExam.questions.length);
+    setTimeLeft(totalSec);
 
+    if (timerRef.current) clearInterval(timerRef.current);
+    timerRef.current = setInterval(() => {
+      setTimeLeft(prev => {
+        if (prev <= 1) {
+          handleNextQuestion();
+          return totalSec;
+        }
+        return prev - 1;
+      });
+    }, 1000);
+
+    return () => { if (timerRef.current) clearInterval(timerRef.current); };
+  }, [view, currentQuestionIndex]); // eslint-disable-line
+
+  // ── Start proctoring once when exam begins
+  useEffect(() => {
+    if (view === 'student-exam') {
       startProctoring();
-
-      return () => {
-        if (timerRef.current) clearInterval(timerRef.current);
-        stopProctoring();
-      };
     }
-  }, [view, currentQuestionIndex]);
+    return () => {
+      if (view !== 'student-exam') stopProctoring();
+    };
+  }, [view]); // eslint-disable-line
 
   // ── Tab switch detection
   useEffect(() => {
     const onVisibility = () => {
-      if (document.hidden && view === 'student-exam') handleViolation('Tab switch detected!');
+      if (document.hidden && viewRef.current === 'student-exam') {
+        handleViolation('Tab switch detected!');
+      }
     };
     document.addEventListener('visibilitychange', onVisibility);
     return () => document.removeEventListener('visibilitychange', onVisibility);
-  }, [view, violations]);
+  }, []); // eslint-disable-line
 
   // ── Disable copy/paste
   useEffect(() => {
@@ -495,22 +519,34 @@ export default function App() {
 
       const exam = { id: snap.docs[0].id, ...snap.docs[0].data() } as Exam;
       setCurrentExam(exam);
-      setViolations(0); setGazeViolations(0); gazeViolationsRef.current = 0;
+      currentExamRef.current = exam;
+      setViolations(0); violationsRef.current = 0;
+      setGazeViolations(0); gazeViolationsRef.current = 0;
+      isSubmittingRef.current = false;
       setCurrentQuestionIndex(0); setAnswers({});
 
+      // FIX: include createdAt so ordering works
       const subRef = await addDoc(collection(db, 'submissions'), {
-        examId: exam.id, examTeacherId: exam.teacherId, studentName, answers: {},
-        violations: 0, status: 'in-progress', score: 0, createdAt: serverTimestamp()
+        examId: exam.id,
+        examTeacherId: exam.teacherId,
+        studentName,
+        answers: {},
+        violations: 0,
+        status: 'in-progress',
+        score: 0,
+        createdAt: serverTimestamp(),
       });
-      setCurrentSubmission({ id: subRef.id, examId: exam.id, studentName, answers: {}, violations: 0, status: 'in-progress', score: 0 });
+      const sub: Submission = { id: subRef.id, examId: exam.id, studentName, answers: {}, violations: 0, status: 'in-progress', score: 0 };
+      setCurrentSubmission(sub);
+      currentSubmissionRef.current = sub;
       setView('student-instructions');
       toast.success('Session joined! Read the instructions.');
     } catch (e) { handleFirestoreError(e, OperationType.CREATE, 'submissions'); }
   };
 
   const handleNextQuestion = () => {
-    if (!currentExam) return;
-    if (currentQuestionIndex < currentExam.questions.length - 1) {
+    if (!currentExamRef.current) return;
+    if (currentQuestionIndex < currentExamRef.current.questions.length - 1) {
       setCurrentQuestionIndex(p => p + 1);
     } else {
       submitExam();
@@ -518,45 +554,65 @@ export default function App() {
   };
 
   const submitExam = async () => {
-    if (!currentSubmission || !currentExam) return;
+    // FIX: prevent double submit
+    if (isSubmittingRef.current) return;
+    isSubmittingRef.current = true;
+
+    const submission = currentSubmissionRef.current;
+    const exam = currentExamRef.current;
+    if (!submission || !exam) { isSubmittingRef.current = false; return; }
+
     stopProctoring();
+    if (timerRef.current) clearInterval(timerRef.current);
+
     let score = 0;
     let essayEvaluations: Record<string, EvaluationResult> = {};
 
-    if (currentExam.type === 'mcq') {
-      currentExam.questions.forEach(q => { if (answers[q.id] === q.correctOptionIndex) score++; });
+    if (exam.type === 'mcq') {
+      exam.questions.forEach(q => {
+        if (answers[q.id] === q.correctOptionIndex) score++;
+      });
     } else {
       const t = toast.loading('Evaluating your answers...', { duration: Infinity });
       try {
-        for (const q of currentExam.questions) {
+        for (const q of exam.questions) {
           const ev = await GeminiService.evaluateEssayAnswer(q.text, q.idealAnswer || '', answers[q.id] || '');
-          essayEvaluations[q.id] = ev; score += ev.score;
+          essayEvaluations[q.id] = ev;
+          score += ev.score;
         }
       } catch { toast.error('Evaluation failed for some questions.'); }
       finally { toast.dismiss(t); }
     }
 
     try {
-      await updateDoc(doc(db, 'submissions', currentSubmission.id), {
-        answers, status: 'submitted', score,
-        essayEvaluations: currentExam.type === 'essay' ? essayEvaluations : null,
-        submittedAt: serverTimestamp()
+      await updateDoc(doc(db, 'submissions', submission.id), {
+        answers,
+        status: 'submitted',
+        score,
+        essayEvaluations: exam.type === 'essay' ? essayEvaluations : null,
+        submittedAt: serverTimestamp(),
       });
       setCurrentSubmission(p => p ? { ...p, score, status: 'submitted', essayEvaluations } : null);
       setView('exam-result');
       toast.success('Exam submitted!');
-    } catch (e) { handleFirestoreError(e, OperationType.UPDATE, `submissions/${currentSubmission.id}`); }
+    } catch (e) {
+      isSubmittingRef.current = false;
+      handleFirestoreError(e, OperationType.UPDATE, `submissions/${submission.id}`);
+    }
   };
 
   // ─────────────────────────────────────────────
   // Violation & Proctoring
   // ─────────────────────────────────────────────
 
+  // FIX: use refs so this is always up-to-date inside async/interval callbacks
   const handleViolation = async (reason: string, screenshot?: string, isGaze = false) => {
-    const newV = violations + 1;
+    if (isSubmittingRef.current) return;
+
+    const newV = violationsRef.current + 1;
+    violationsRef.current = newV;
     setViolations(newV);
 
-    // NEW: gaze-specific counter — submit after 3 gaze look-aways
     if (isGaze) {
       const newG = gazeViolationsRef.current + 1;
       gazeViolationsRef.current = newG;
@@ -571,6 +627,7 @@ export default function App() {
       toast.warning(`Violation: ${reason} (${newV}/3)`);
     }
 
+    // Capture screenshot if not provided
     let finalScreenshot = screenshot;
     if (!finalScreenshot && videoRef.current && canvasRef.current) {
       const ctx = canvasRef.current.getContext('2d');
@@ -580,13 +637,20 @@ export default function App() {
       }
     }
 
-    if (currentSubmission && currentExam) {
+    const submission = currentSubmissionRef.current;
+    const exam = currentExamRef.current;
+
+    if (submission && exam) {
       try {
-        await updateDoc(doc(db, 'submissions', currentSubmission.id), { violations: newV });
+        await updateDoc(doc(db, 'submissions', submission.id), { violations: newV });
         await addDoc(collection(db, 'violations'), {
-          examId: currentExam.id, teacherId: currentExam.teacherId,
-          submissionId: currentSubmission.id, studentName: currentSubmission.studentName,
-          reason, screenshot: finalScreenshot || null, timestamp: serverTimestamp()
+          examId: exam.id,
+          teacherId: exam.teacherId,
+          submissionId: submission.id,
+          studentName: submission.studentName,
+          reason,
+          screenshot: finalScreenshot || null,
+          timestamp: serverTimestamp(),
         });
       } catch (e) { console.error('Error logging violation:', e); }
     }
@@ -597,24 +661,32 @@ export default function App() {
     }
   };
 
-  // ── NEW: startProctoring — enforces camera on, gaze detection
   const startProctoring = async () => {
+    // Stop any existing stream first
+    stopProctoring();
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true })
-        .catch(() => navigator.mediaDevices.getUserMedia({ video: true }));
-
+      let stream: MediaStream;
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+      } catch {
+        stream = await navigator.mediaDevices.getUserMedia({ video: true });
+      }
       streamRef.current = stream;
-      if (videoRef.current) { videoRef.current.srcObject = stream; }
+      if (videoRef.current) {
+        videoRef.current.srcObject = stream;
+      }
       setCameraBlocked(false);
 
-      // Periodic gaze analysis every 8 seconds
+      // FIX: use viewRef inside interval so it reads latest view value
       proctoringIntervalRef.current = setInterval(() => {
-        if (view === 'student-exam') captureAndAnalyze();
+        if (viewRef.current === 'student-exam') {
+          captureAndAnalyze();
+        }
       }, 8000);
 
     } catch {
       setCameraBlocked(true);
-      toast.error('Camera access is REQUIRED to start the exam.');
+      toast.error('Camera access is REQUIRED to take this exam.');
     }
   };
 
@@ -624,7 +696,10 @@ export default function App() {
       streamRef.current = null;
     }
     if (videoRef.current) videoRef.current.srcObject = null;
-    if (proctoringIntervalRef.current) { clearInterval(proctoringIntervalRef.current); proctoringIntervalRef.current = null; }
+    if (proctoringIntervalRef.current) {
+      clearInterval(proctoringIntervalRef.current);
+      proctoringIntervalRef.current = null;
+    }
   };
 
   const captureAndAnalyze = async () => {
@@ -641,29 +716,24 @@ export default function App() {
     } catch (e) { console.error('Proctoring analysis failed', e); }
   };
 
-  // ── NEW: AI hint for essay questions
+  // FIX: AI hint now uses GeminiService instead of calling Anthropic API directly from browser.
+  // Direct browser-to-Anthropic calls fail with CORS errors and expose your API key.
   const handleGetAiHint = async () => {
     if (!currentExam) return;
     const q = currentExam.questions[currentQuestionIndex];
-    setIsLoadingHint(true); setAiHint(null);
+    setIsLoadingHint(true);
+    setAiHint(null);
     try {
-      // Ask AI for a hint based on the question (not the ideal answer, to avoid giving it away)
-      const response = await fetch('https://api.anthropic.com/v1/messages', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          model: 'claude-sonnet-4-20250514', max_tokens: 300,
-          messages: [{
-            role: 'user',
-            content: `A student is answering this exam question: "${q.text}"\n\nTheir current answer: "${answers[q.id] || '(no answer yet)'}".\n\nGive a SHORT helpful hint (2-3 sentences max) that guides them in the right direction WITHOUT giving away the full answer. Focus on what key concepts they should think about.`
-          }]
-        })
-      });
-      const data = await response.json();
-      const hint = data.content?.map((c: any) => c.text || '').join('') || 'Could not generate hint.';
+      const hint = await GeminiService.getEssayHint(
+        q.text,
+        answers[q.id] || ''
+      );
       setAiHint(hint);
-    } catch { setAiHint('Could not load hint. Please try again.'); }
-    finally { setIsLoadingHint(false); }
+    } catch {
+      setAiHint('Could not load hint. Please try again.');
+    } finally {
+      setIsLoadingHint(false);
+    }
   };
 
   // ── Download results CSV
@@ -831,7 +901,6 @@ export default function App() {
         </div>
       </div>
 
-      {/* Stats */}
       <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
         {[
           { icon: BookOpen, color: 'blue', val: exams.length, label: 'Total Exams' },
@@ -848,9 +917,7 @@ export default function App() {
         ))}
       </div>
 
-      {/* Exams list + Violations feed */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
-        {/* Exams */}
         <div className="bg-white rounded-2xl border border-gray-100 shadow-sm overflow-hidden">
           <div className="p-6 border-b border-gray-50"><h3 className="font-bold text-gray-900">Your Exams</h3></div>
           <div className="divide-y divide-gray-50 max-h-[400px] overflow-y-auto">
@@ -885,7 +952,6 @@ export default function App() {
           </div>
         </div>
 
-        {/* Live violations */}
         <div className="bg-white rounded-2xl border border-gray-100 shadow-sm overflow-hidden">
           <div className="p-6 border-b border-gray-50 flex justify-between items-center bg-red-50/30">
             <div className="flex items-center gap-2">
@@ -907,8 +973,8 @@ export default function App() {
                 </div>
                 <div className="text-xs text-red-600 font-medium mt-0.5">{v.reason}</div>
                 {v.screenshot && (
-                  <div className="mt-2 rounded-lg overflow-hidden border border-gray-100 w-32 h-18">
-                    <img src={`data:image/jpeg;base64,${v.screenshot}`} alt="screenshot" className="w-full h-full object-cover" />
+                  <div className="mt-2 rounded-lg overflow-hidden border border-gray-100 w-32">
+                    <img src={`data:image/jpeg;base64,${v.screenshot}`} alt="screenshot" className="w-full object-cover" />
                   </div>
                 )}
               </div>
@@ -917,7 +983,6 @@ export default function App() {
         </div>
       </div>
 
-      {/* All Submissions */}
       <div className="bg-white rounded-2xl border border-gray-100 shadow-sm overflow-hidden">
         <div className="p-6 border-b border-gray-50 flex justify-between items-center">
           <h3 className="font-bold text-gray-900">All Student Submissions</h3>
@@ -962,7 +1027,6 @@ export default function App() {
         </div>
       </div>
 
-      {/* Submission detail modal */}
       <AnimatePresence>
         {selectedSubmission && (
           <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
@@ -1072,7 +1136,7 @@ export default function App() {
   );
 
   // ─────────────────────────────────────────────
-  // Render: Student Instructions — NEW: shows teacher name + exam name
+  // Render: Student Instructions
   // ─────────────────────────────────────────────
 
   const renderStudentInstructions = () => (
@@ -1080,7 +1144,6 @@ export default function App() {
       <motion.div initial={{ opacity: 0, scale: 0.95 }} animate={{ opacity: 1, scale: 1 }}
         className="bg-white p-10 rounded-[40px] shadow-2xl w-full max-w-2xl border border-gray-100 space-y-8">
 
-        {/* NEW: Exam + Teacher info banner */}
         <div className="bg-brand-blue text-white p-6 rounded-2xl text-center space-y-1">
           <div className="text-xs font-bold text-blue-200 uppercase tracking-widest">You are about to take</div>
           <div className="text-2xl font-black">{currentExam?.title}</div>
@@ -1116,7 +1179,6 @@ export default function App() {
           ))}
         </div>
 
-        {/* NEW: gaze warning */}
         <div className="bg-red-50 p-5 rounded-3xl border border-red-100">
           <div className="flex gap-3">
             <Eye className="w-6 h-6 text-red-500 shrink-0 mt-0.5" />
@@ -1139,7 +1201,7 @@ export default function App() {
   );
 
   // ─────────────────────────────────────────────
-  // Render: Student Exam — NEW: camera gate, gaze counter, AI hint
+  // Render: Student Exam
   // ─────────────────────────────────────────────
 
   const renderStudentExam = () => {
@@ -1147,7 +1209,6 @@ export default function App() {
     const question = currentExam.questions[currentQuestionIndex];
     const progress = ((currentQuestionIndex + 1) / currentExam.questions.length) * 100;
 
-    // Camera blocked gate
     if (cameraBlocked) {
       return (
         <div className="flex items-center justify-center min-h-[70vh] px-4">
@@ -1167,7 +1228,6 @@ export default function App() {
 
     return (
       <div className="max-w-5xl mx-auto px-4 py-8 grid grid-cols-1 lg:grid-cols-3 gap-8">
-        {/* Question panel */}
         <div className="lg:col-span-2 space-y-6">
           <div className="bg-white p-6 rounded-3xl shadow-sm border border-gray-100">
             <div className="flex justify-between items-center mb-6">
@@ -1208,14 +1268,12 @@ export default function App() {
                       placeholder="Type your answer here..."
                       className="w-full h-52 p-6 rounded-2xl border-2 border-gray-100 focus:border-brand-blue outline-none resize-none text-lg leading-relaxed" />
 
-                    {/* NEW: AI hint button */}
                     <button onClick={handleGetAiHint} disabled={isLoadingHint}
                       className="flex items-center gap-2 text-amber-600 bg-amber-50 px-4 py-2 rounded-lg font-semibold hover:bg-amber-100 transition-all disabled:opacity-50 text-sm">
                       <Lightbulb className="w-4 h-4" />
                       {isLoadingHint ? 'Getting hint...' : 'Get AI Hint'}
                     </button>
 
-                    {/* Hint display */}
                     <AnimatePresence>
                       {aiHint && (
                         <motion.div initial={{ opacity: 0, y: -8 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0 }}
@@ -1245,7 +1303,6 @@ export default function App() {
           </div>
         </div>
 
-        {/* Proctoring panel */}
         <div className="space-y-6">
           <div className="bg-white p-6 rounded-3xl shadow-sm border border-gray-100 overflow-hidden">
             <div className="flex items-center gap-2 mb-4">
@@ -1263,7 +1320,6 @@ export default function App() {
             <p className="text-xs text-gray-500 mt-3 italic">AI is monitoring your gaze direction and environment.</p>
           </div>
 
-          {/* NEW: Gaze violation counter */}
           <div className="bg-white p-6 rounded-3xl shadow-sm border border-gray-100">
             <div className="flex items-center gap-2 mb-3">
               <Eye className="w-5 h-5 text-brand-blue" />
@@ -1284,7 +1340,6 @@ export default function App() {
             </p>
           </div>
 
-          {/* General violations */}
           <div className="bg-white p-6 rounded-3xl shadow-sm border border-gray-100">
             <div className="flex items-center gap-2 mb-3">
               <AlertTriangle className="w-5 h-5 text-amber-500" />
@@ -1351,7 +1406,7 @@ export default function App() {
               <span className="text-gray-500">Other violations:</span>
               <span className={`font-bold ${violations > 0 ? 'text-red-500' : 'text-blue-500'}`}>{violations}</span>
             </div>
-            <button onClick={() => setView('landing')}
+            <button onClick={() => { stopProctoring(); setView('landing'); }}
               className="w-full bg-gray-900 text-white py-4 rounded-2xl font-bold hover:bg-black transition-all shadow-xl shadow-gray-200">
               Return to Home
             </button>
@@ -1387,7 +1442,7 @@ export default function App() {
       <Toaster position="top-center" richColors />
 
       <nav className="px-6 py-4 flex justify-between items-center max-w-7xl mx-auto">
-        <div className="flex items-center gap-2 cursor-pointer" onClick={() => setView('landing')}>
+        <div className="flex items-center gap-2 cursor-pointer" onClick={() => { stopProctoring(); setView('landing'); }}>
           <div className="bg-brand-blue p-1.5 rounded-lg">
             <Shield className="w-5 h-5 text-brand-gold" />
           </div>
@@ -1420,7 +1475,6 @@ export default function App() {
         {view === 'exam-result' && renderExamResult()}
       </main>
 
-      {/* New exam code modal */}
       <AnimatePresence>
         {newExamCode && (
           <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
