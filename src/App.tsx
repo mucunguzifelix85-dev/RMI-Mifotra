@@ -678,7 +678,7 @@ export default function App() {
   };
 
   const handleTeacherLogin = (password: string) => {
-    if (password === 'ABC2123G') {
+    if (password === 'EXAM@123') {
       setTeacherAuth(true);
       setView('teacher-dashboard');
       toast.success('Welcome back, Teacher!');
