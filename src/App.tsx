@@ -10,6 +10,7 @@
  * 5. Added null-checks before Firestore writes to prevent crashes
  * 6. handleViolation made safe with useCallback-style ref pattern
  * 7. createdAt added to submission docs properly
+ * 8. Friendly error messages for auth/email-already-in-use and auth/invalid-credential
  */
 
 import React, { useState, useEffect, useRef, useCallback } from 'react';
@@ -323,15 +324,14 @@ export default function App() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const timerRef = useRef<NodeJS.Timeout | null>(null);
   const gazeViolationsRef = useRef(0);
-  const violationsRef = useRef(0);           // FIX: ref so async callbacks always have latest count
+  const violationsRef = useRef(0);
   const streamRef = useRef<MediaStream | null>(null);
   const proctoringIntervalRef = useRef<NodeJS.Timeout | null>(null);
-  const viewRef = useRef<View>('landing');   // FIX: ref so interval closure always has latest view
+  const viewRef = useRef<View>('landing');
   const currentSubmissionRef = useRef<Submission | null>(null);
   const currentExamRef = useRef<Exam | null>(null);
-  const isSubmittingRef = useRef(false);     // FIX: prevent double submit
+  const isSubmittingRef = useRef(false);
 
-  // Keep refs in sync with state
   useEffect(() => { viewRef.current = view; }, [view]);
   useEffect(() => { currentSubmissionRef.current = currentSubmission; }, [currentSubmission]);
   useEffect(() => { currentExamRef.current = currentExam; }, [currentExam]);
@@ -360,16 +360,12 @@ export default function App() {
     if (!teacherProfile) return;
     fetchExams();
 
-    // FIX: Removed orderBy('createdAt','desc') from submissions query.
-    // That query requires a Firestore composite index which you may not have created.
-    // We sort client-side instead.
     const subQ = query(
       collection(db, 'submissions'),
       where('examTeacherId', '==', teacherProfile.id)
     );
     const unsubSubs = onSnapshot(subQ, snap => {
       const subs = snap.docs.map(d => ({ id: d.id, ...d.data() } as Submission));
-      // Sort client-side: newest first
       subs.sort((a: any, b: any) => (b.createdAt?.seconds || 0) - (a.createdAt?.seconds || 0));
       setAllSubmissions(subs);
     }, e => handleFirestoreError(e, OperationType.LIST, 'submissions'));
@@ -384,7 +380,7 @@ export default function App() {
     return () => { unsubSubs(); unsubViols(); };
   }, [teacherProfile]);
 
-  // ── Exam timer (per question)
+  // ── Exam timer
   useEffect(() => {
     if (view !== 'student-exam' || !currentExam) return;
 
@@ -405,7 +401,7 @@ export default function App() {
     return () => { if (timerRef.current) clearInterval(timerRef.current); };
   }, [view, currentQuestionIndex]); // eslint-disable-line
 
-  // ── Start proctoring once when exam begins
+  // ── Start proctoring
   useEffect(() => {
     if (view === 'student-exam') {
       startProctoring();
@@ -457,7 +453,10 @@ export default function App() {
       setView('teacher-dashboard');
       toast.success(`Welcome, ${regName}!`);
     } catch (e: any) {
-      setAuthError(e.message || 'Registration failed.');
+      if (e.code === 'auth/email-already-in-use') setAuthError('This email is already registered. Please login instead.');
+      else if (e.code === 'auth/weak-password') setAuthError('Password must be at least 6 characters.');
+      else if (e.code === 'auth/invalid-email') setAuthError('Please enter a valid email address.');
+      else setAuthError('Registration failed. Please try again.');
     }
   };
 
@@ -473,7 +472,11 @@ export default function App() {
       setView('teacher-dashboard');
       toast.success(`Welcome back, ${profile.name}!`);
     } catch (e: any) {
-      setAuthError(e.message || 'Login failed.');
+      if (e.code === 'auth/invalid-credential') setAuthError('Wrong email or password. Please try again.');
+      else if (e.code === 'auth/user-not-found') setAuthError('No account found with this email.');
+      else if (e.code === 'auth/wrong-password') setAuthError('Incorrect password. Please try again.');
+      else if (e.code === 'auth/too-many-requests') setAuthError('Too many attempts. Please wait a moment.');
+      else setAuthError('Login failed. Please try again.');
     }
   };
 
@@ -525,7 +528,6 @@ export default function App() {
       isSubmittingRef.current = false;
       setCurrentQuestionIndex(0); setAnswers({});
 
-      // FIX: include createdAt so ordering works
       const subRef = await addDoc(collection(db, 'submissions'), {
         examId: exam.id,
         examTeacherId: exam.teacherId,
@@ -554,7 +556,6 @@ export default function App() {
   };
 
   const submitExam = async () => {
-    // FIX: prevent double submit
     if (isSubmittingRef.current) return;
     isSubmittingRef.current = true;
 
@@ -605,7 +606,6 @@ export default function App() {
   // Violation & Proctoring
   // ─────────────────────────────────────────────
 
-  // FIX: use refs so this is always up-to-date inside async/interval callbacks
   const handleViolation = async (reason: string, screenshot?: string, isGaze = false) => {
     if (isSubmittingRef.current) return;
 
@@ -627,7 +627,6 @@ export default function App() {
       toast.warning(`Violation: ${reason} (${newV}/3)`);
     }
 
-    // Capture screenshot if not provided
     let finalScreenshot = screenshot;
     if (!finalScreenshot && videoRef.current && canvasRef.current) {
       const ctx = canvasRef.current.getContext('2d');
@@ -662,7 +661,6 @@ export default function App() {
   };
 
   const startProctoring = async () => {
-    // Stop any existing stream first
     stopProctoring();
     try {
       let stream: MediaStream;
@@ -677,7 +675,6 @@ export default function App() {
       }
       setCameraBlocked(false);
 
-      // FIX: use viewRef inside interval so it reads latest view value
       proctoringIntervalRef.current = setInterval(() => {
         if (viewRef.current === 'student-exam') {
           captureAndAnalyze();
@@ -716,8 +713,6 @@ export default function App() {
     } catch (e) { console.error('Proctoring analysis failed', e); }
   };
 
-  // FIX: AI hint now uses GeminiService instead of calling Anthropic API directly from browser.
-  // Direct browser-to-Anthropic calls fail with CORS errors and expose your API key.
   const handleGetAiHint = async () => {
     if (!currentExam) return;
     const q = currentExam.questions[currentQuestionIndex];
